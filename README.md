@@ -9,5 +9,6 @@ This is a very much work in progress. Things are untested, incomplete, and likel
 - [x] Basic X/Y axes
 - [x] Centre calibration and deadzone
 - [x] Collective with 8 buttons and 2 switches
+- [ ] ADS1115
 - [ ] Pedals
 - [ ] More buttons for cyclic
