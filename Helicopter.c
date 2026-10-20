@@ -10,19 +10,29 @@
 // CONFIG
 // ================================================================
 
+// Cyclic X
+#define CYCLIC_X_GPIO         26
+#define CYCLIC_X_ADC_CH       0
+
+// Cyclic Y
+#define CYCLIC_Y_GPIO         27
+#define CYCLIC_Y_ADC_CH       1
+
 // Collective
 #define COLLECTIVE_GPIO       28
 #define COLLECTIVE_ADC_CH     2
 
 #define ADC_SAMPLES           8
 
-// Set true if collective moves in the wrong direction
+// Cyclic deadzone around calibrated center
+#define CYCLIC_DEADZONE       50
+
+// Change these if an axis moves in the wrong direction
+#define INVERT_CYCLIC_X       false
+#define INVERT_CYCLIC_Y       false
 #define INVERT_COLLECTIVE     false
 
-// USB report interval
 #define REPORT_PERIOD_MS      2
-
-// Button debounce
 #define DEBOUNCE_MS           10
 
 
@@ -34,44 +44,62 @@
 #define MATRIX_COLS 3
 
 static const uint row_pins[MATRIX_ROWS] = {
-    0,      // R0
-    1,      // R1
-    2,      // R2
-    3       // R3
+    0,  // R0
+    1,  // R1
+    2,  // R2
+    3   // R3
 };
 
 static const uint col_pins[MATRIX_COLS] = {
-    6,      // C0
-    7,      // C1
-    8       // C2
-    
+    6,  // C0
+    7,  // C1
+    8   // C2
 };
+
+
+/*
+ * Matrix:
+ *
+ *              C0          C1          C2
+ *
+ * R0 GP0       BTN7        BTN3        SW1 UP
+ * R1 GP1       BTN6        BTN2        SW1 DOWN
+ * R2 GP2       BTN5        BTN1        SW2 UP
+ * R3 GP3       BTN4        BTN8        SW2 DOWN
+ *
+ *
+ * HID:
+ *
+ * Button 1  = BTN1
+ * Button 2  = BTN2
+ * Button 3  = BTN3
+ * Button 4  = BTN4
+ * Button 5  = BTN5
+ * Button 6  = BTN6
+ * Button 7  = BTN7
+ * Button 8  = BTN8
+ * Button 9  = SW1 UP
+ * Button 10 = SW1 DOWN
+ * Button 11 = SW2 UP
+ * Button 12 = SW2 DOWN
+ *
+ * Values below are zero-based HID bit positions.
+ */
 
 static const int8_t button_map[MATRIX_ROWS][MATRIX_COLS] = {
 
     // C0   C1   C2
 
-    { 0,    6,   8  },   // R0
-    { 1,    5,   9  },   // R1
-    { 2,    4,  10  },   // R2
-    { 3,    7,  11  }    // R3
+    { 6,    2,    8 },   // R0
+    { 5,    1,    9 },   // R1
+    { 4,    0,   10 },   // R2
+    { 3,    7,   11 }    // R3
 };
 
 
 // ================================================================
 // HID REPORT
 // ================================================================
-
-/*
- * Must match usb_descriptors.c exactly:
- *
- * 2 bytes X
- * 2 bytes Y
- * 2 bytes Z
- * 2 bytes buttons
- *
- * Total = 8 bytes
- */
 
 typedef struct __attribute__((packed))
 {
@@ -82,6 +110,14 @@ typedef struct __attribute__((packed))
     uint16_t buttons;
 
 } joystick_report_t;
+
+
+// ================================================================
+// AXIS STATE
+// ================================================================
+
+static uint16_t cyclic_x_center = 2048;
+static uint16_t cyclic_y_center = 2048;
 
 
 // ================================================================
@@ -105,6 +141,8 @@ static void adc_setup(void)
 {
     adc_init();
 
+    adc_gpio_init(CYCLIC_X_GPIO);
+    adc_gpio_init(CYCLIC_Y_GPIO);
     adc_gpio_init(COLLECTIVE_GPIO);
 }
 
@@ -124,48 +162,184 @@ static uint16_t read_adc_average(uint input)
 }
 
 
-/*
- * Convert:
- *
- * ADC:
- *     0 ... 4095
- *
- * HID:
- *    -32767 ... +32767
- *
- * Collective is NOT centred at startup.
- * It uses the entire potentiometer range.
- */
+// ================================================================
+// CYCLIC CALIBRATION
+// ================================================================
+
+static void calibrate_cyclic(void)
+{
+    /*
+     * Keep cyclic centered while Pico starts.
+     *
+     * Take several readings and use their average
+     * as the mechanical center.
+     */
+
+    uint32_t x_total = 0;
+    uint32_t y_total = 0;
+
+    const int samples = 64;
+
+
+    for (int i = 0; i < samples; i++)
+    {
+        x_total += read_adc_average(CYCLIC_X_ADC_CH);
+        y_total += read_adc_average(CYCLIC_Y_ADC_CH);
+
+        sleep_ms(2);
+    }
+
+
+    cyclic_x_center =
+        (uint16_t)(x_total / samples);
+
+    cyclic_y_center =
+        (uint16_t)(y_total / samples);
+}
+
+
+// ================================================================
+// CYCLIC AXIS SCALING
+// ================================================================
+
+static int16_t scale_cyclic(
+    uint16_t raw,
+    uint16_t center,
+    bool invert
+)
+{
+    int32_t delta =
+        (int32_t)raw -
+        (int32_t)center;
+
+
+    /*
+     * Deadzone around center.
+     */
+    if (
+        delta > -CYCLIC_DEADZONE &&
+        delta < CYCLIC_DEADZONE
+    )
+    {
+        delta = 0;
+    }
+    else if (delta > 0)
+    {
+        delta -= CYCLIC_DEADZONE;
+    }
+    else
+    {
+        delta += CYCLIC_DEADZONE;
+    }
+
+
+    /*
+     * Positive and negative travel can be different
+     * because the calibrated center may not be
+     * exactly 2048.
+     */
+
+    int32_t positive_span =
+        4095 -
+        center -
+        CYCLIC_DEADZONE;
+
+    int32_t negative_span =
+        center -
+        CYCLIC_DEADZONE;
+
+
+    if (positive_span < 1)
+    {
+        positive_span = 1;
+    }
+
+    if (negative_span < 1)
+    {
+        negative_span = 1;
+    }
+
+
+    int32_t output;
+
+
+    if (delta >= 0)
+    {
+        output =
+            (delta * 32767L) /
+            positive_span;
+    }
+    else
+    {
+        output =
+            (delta * 32767L) /
+            negative_span;
+    }
+
+
+    if (output > 32767)
+    {
+        output = 32767;
+    }
+
+    if (output < -32767)
+    {
+        output = -32767;
+    }
+
+
+    if (invert)
+    {
+        output = -output;
+    }
+
+
+    return (int16_t)output;
+}
+
+
+// ================================================================
+// COLLECTIVE AXIS SCALING
+// ================================================================
 
 static int16_t scale_collective(uint16_t raw)
 {
-    int32_t value =
-        ((int32_t)raw * 65534L / 4095L) - 32767L;
+    /*
+     * Collective uses the complete potentiometer range.
+     *
+     * ADC 0    -> -32767
+     * ADC 2048 -> ~0
+     * ADC 4095 -> +32767
+     */
+
+    int32_t output =
+        ((int32_t)raw * 65534L / 4095L)
+        - 32767L;
 
 
-    if (value > 32767)
+    if (output > 32767)
     {
-        value = 32767;
+        output = 32767;
     }
 
-    if (value < -32767)
+    if (output < -32767)
     {
-        value = -32767;
+        output = -32767;
     }
 
 
     if (INVERT_COLLECTIVE)
     {
-        value = -value;
+        output = -output;
     }
 
 
-    return (int16_t)value;
+    return (int16_t)output;
 }
 
 
 // ================================================================
-// MATRIX
+// BUTTON MATRIX
 // ================================================================
 
 static void matrix_disable_all_rows(void)
@@ -187,13 +361,13 @@ static void matrix_disable_all_rows(void)
 static void matrix_activate_row(int row)
 {
     /*
-     * All inactive rows are high impedance.
+     * Inactive rows = high impedance.
      */
     matrix_disable_all_rows();
 
 
     /*
-     * Selected row is driven LOW.
+     * Current row = LOW.
      */
     gpio_put(
         row_pins[row],
@@ -210,6 +384,7 @@ static void matrix_activate_row(int row)
 static void matrix_init(void)
 {
     // Rows
+
     for (int row = 0; row < MATRIX_ROWS; row++)
     {
         gpio_init(
@@ -228,6 +403,7 @@ static void matrix_init(void)
 
 
     // Columns
+
     for (int col = 0; col < MATRIX_COLS; col++)
     {
         gpio_init(
@@ -240,10 +416,7 @@ static void matrix_init(void)
         );
 
         /*
-         * Column normally HIGH.
-         *
-         * Pressed switch connects it
-         * to the active LOW row.
+         * Columns normally HIGH.
          */
         gpio_pull_up(
             col_pins[col]
@@ -268,10 +441,6 @@ static void matrix_scan(void)
     {
         matrix_activate_row(row);
 
-
-        /*
-         * Give signals time to settle.
-         */
         sleep_us(5);
 
 
@@ -281,16 +450,6 @@ static void matrix_scan(void)
                 button_map[row][col];
 
 
-            // Unused matrix position
-            if (button < 0)
-            {
-                continue;
-            }
-
-
-            /*
-             * Column LOW = switch closed.
-             */
             bool pressed =
                 !gpio_get(
                     col_pins[col]
@@ -298,7 +457,7 @@ static void matrix_scan(void)
 
 
             /*
-             * Raw state changed.
+             * Raw electrical state changed.
              */
             if (
                 pressed !=
@@ -314,8 +473,7 @@ static void matrix_scan(void)
 
 
             /*
-             * Raw signal has been stable
-             * long enough -> accept it.
+             * Accept the new state after debounce.
              */
             if (
                 (now -
@@ -353,7 +511,7 @@ static void matrix_scan(void)
 
 
 // ================================================================
-// HID
+// HID TASK
 // ================================================================
 
 static void hid_task(void)
@@ -389,26 +547,42 @@ static void hid_task(void)
     }
 
 
-    joystick_report_t report;
-
-
     /*
-     * Cyclic is not connected yet.
-     *
-     * Keep X/Y centred.
+     * Read all three analog controls.
      */
 
-    report.x = 0;
-    report.y = 0;
+    uint16_t raw_x =
+        read_adc_average(
+            CYCLIC_X_ADC_CH
+        );
 
-
-    /*
-     * Collective is currently Z axis.
-     */
+    uint16_t raw_y =
+        read_adc_average(
+            CYCLIC_Y_ADC_CH
+        );
 
     uint16_t raw_collective =
         read_adc_average(
             COLLECTIVE_ADC_CH
+        );
+
+
+    joystick_report_t report;
+
+
+    report.x =
+        scale_cyclic(
+            raw_x,
+            cyclic_x_center,
+            INVERT_CYCLIC_X
+        );
+
+
+    report.y =
+        scale_cyclic(
+            raw_y,
+            cyclic_y_center,
+            INVERT_CYCLIC_Y
         );
 
 
@@ -418,17 +592,12 @@ static void hid_task(void)
         );
 
 
-    /*
-     * Buttons 1-11.
-     */
-
     report.buttons =
         button_mask;
 
 
     /*
-     * Only send a USB packet when
-     * something changed.
+     * Only send report if something changed.
      */
 
     if (
@@ -473,7 +642,17 @@ int main(void)
 
 
     /*
-     * TinyUSB device stack.
+     * IMPORTANT:
+     *
+     * Keep cyclic centered during this calibration.
+     *
+     * Collective position does not matter.
+     */
+    calibrate_cyclic();
+
+
+    /*
+     * Start TinyUSB HID device.
      */
     tusb_init();
 
@@ -481,26 +660,23 @@ int main(void)
     while (true)
     {
         /*
-         * TinyUSB must run continuously.
+         * USB stack.
          */
         tud_task();
 
 
         /*
-         * Scan physical switches.
+         * Buttons and switches.
          */
         matrix_scan();
 
 
         /*
-         * Send joystick state.
+         * X, Y, collective and buttons -> USB HID.
          */
         hid_task();
 
 
-        /*
-         * ~1 kHz main loop.
-         */
         sleep_ms(1);
     }
 }
