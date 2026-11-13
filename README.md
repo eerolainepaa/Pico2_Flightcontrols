@@ -6,9 +6,9 @@ This is a very much work in progress. Things are untested, incomplete, and likel
 
 ## Features
 
-- [x] Basic X/Y axes
+- [x] Cyclic X/Y axes
 - [x] Centre calibration and deadzone
 - [x] Collective with 8 buttons and 2 switches
-- [ ] ADS1115
-- [ ] Pedals
-- [ ] More buttons for cyclic
+- [x] ADS1115
+- [x] Pedals (with toe brakes for airplanes)
+- [ ] Add buttons for cyclic

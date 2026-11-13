@@ -35,10 +35,10 @@ pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(Helicopter Helicopter.c usb_descriptor.c)
+add_executable(Helicopter Helicopter.c usb_descriptor.c ads1115.c)
 
 pico_set_program_name(Helicopter "Helicopter")
-pico_set_program_version(Helicopter "0.1")
+pico_set_program_version(Helicopter "0.2")
 
 # Modify the below lines to enable/disable output over UART/USB
 pico_enable_stdio_uart(Helicopter 0)
@@ -49,7 +49,9 @@ target_link_libraries(Helicopter
         pico_stdlib
         tinyusb_device
         tinyusb_board
-        hardware_adc)
+        hardware_adc
+        hardware_i2c
+        pico_unique_id)
 
 # Add the standard include files to the build
 target_include_directories(Helicopter PRIVATE
@@ -63,3 +65,6 @@ target_link_libraries(Helicopter
 
 pico_add_extra_outputs(Helicopter)
 
+
+set_source_files_properties(Helicopter.c usb_descriptor.c ads1115.c
+    PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")

@@ -9,7 +9,9 @@ extern "C" {
 #error CFG_TUSB_MCU must be defined
 #endif
 
+#ifndef CFG_TUSB_OS
 #define CFG_TUSB_OS             OPT_OS_NONE
+#endif
 #define CFG_TUSB_DEBUG          0
 
 // Device mode
@@ -32,8 +34,7 @@ extern "C" {
 #define CFG_TUD_VENDOR          0
 
 
-// Our report is only 8 bytes,
-// so 16 bytes is more than enough.
+// Seven 16-bit axes + 16 button bits = exactly 16 bytes (no report ID).
 #define CFG_TUD_HID_EP_BUFSIZE  16
 
 

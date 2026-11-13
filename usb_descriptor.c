@@ -30,7 +30,7 @@ static const tusb_desc_device_t desc_device =
     .idVendor           = 0xCafe,
     .idProduct          = 0x4010,
 
-    .bcdDevice          = 0x0100,
+    .bcdDevice          = 0x0200,
 
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
@@ -52,25 +52,10 @@ uint8_t const *tud_descriptor_device_cb(void)
 // ================================================================
 
 /*
- * Must match joystick_report_t:
- *
- * int16_t  x        2 bytes
- * int16_t  y        2 bytes
- * int16_t  z        2 bytes
- * uint16_t buttons  2 bytes
- *
- * Total = 8 bytes
- *
- *
- * Current use:
- *
- * X = unused / centre
- * Y = unused / centre
- * Z = collective
- *
- * Buttons 1-11 = button matrix
- *
- * Buttons 12-16 reserved for expansion.
+ * Seven signed 16-bit axes + 16 button bits = 16 bytes, with no report ID.
+ * X/Y = cyclic, Z = collective, Rx/Ry = left/right brakes,
+ * Rz = rudder, Slider = throttle. Buttons 1..12 retain the matrix mapping;
+ * button bits 12..15 remain reserved and zero.
  */
 
 static const uint8_t desc_hid_report[] =
@@ -89,7 +74,7 @@ static const uint8_t desc_hid_report[] =
 
 
         // ========================================================
-        // X, Y, Z
+        // X, Y, Z, Rx, Ry, Rz, Slider
         // ========================================================
 
         HID_USAGE_PAGE(
@@ -108,6 +93,11 @@ static const uint8_t desc_hid_report[] =
             HID_USAGE_DESKTOP_Z
         ),
 
+        HID_USAGE(HID_USAGE_DESKTOP_RX),
+        HID_USAGE(HID_USAGE_DESKTOP_RY),
+        HID_USAGE(HID_USAGE_DESKTOP_RZ),
+        HID_USAGE(HID_USAGE_DESKTOP_SLIDER),
+
 
         HID_LOGICAL_MIN_N(
             -32767,
@@ -125,7 +115,7 @@ static const uint8_t desc_hid_report[] =
         ),
 
         HID_REPORT_COUNT(
-            3
+            7
         ),
 
 
@@ -403,39 +393,3 @@ tud_descriptor_string_cb(
 }
 
 
-// ================================================================
-// HID CALLBACKS
-// ================================================================
-
-uint16_t tud_hid_get_report_cb(
-    uint8_t instance,
-    uint8_t report_id,
-    hid_report_type_t report_type,
-    uint8_t *buffer,
-    uint16_t reqlen
-)
-{
-    (void)instance;
-    (void)report_id;
-    (void)report_type;
-    (void)buffer;
-    (void)reqlen;
-
-    return 0;
-}
-
-
-void tud_hid_set_report_cb(
-    uint8_t instance,
-    uint8_t report_id,
-    hid_report_type_t report_type,
-    uint8_t const *buffer,
-    uint16_t bufsize
-)
-{
-    (void)instance;
-    (void)report_id;
-    (void)report_type;
-    (void)buffer;
-    (void)bufsize;
-}

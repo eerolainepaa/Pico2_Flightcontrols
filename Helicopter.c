@@ -5,36 +5,34 @@
 #include "pico/stdlib.h"
 #include "hardware/adc.h"
 #include "tusb.h"
+#include "ads1115.h"
+#include "axis_scaling.h"
+#include "joystick_report.h"
 
-// ================================================================
-// CONFIG
-// ================================================================
+// Pedals use the Pico ADC. Cyclic, collective and throttle use ADS1115 AIN0..3.
+#define RUDDER_GPIO          26
+#define LEFT_BRAKE_GPIO      27
+#define RIGHT_BRAKE_GPIO     28
+#define ADC_SAMPLES          8
 
-// Cyclic X
-#define CYCLIC_X_GPIO         26
-#define CYCLIC_X_ADC_CH       0
+#define INVERT_CYCLIC_X      false
+#define INVERT_CYCLIC_Y      false
+#define INVERT_COLLECTIVE    false
+#define INVERT_THROTTLE      false
+#define INVERT_RUDDER        false
+#define INVERT_LEFT_BRAKE    false
+#define INVERT_RIGHT_BRAKE   false
 
-// Cyclic Y
-#define CYCLIC_Y_GPIO         27
-#define CYCLIC_Y_ADC_CH       1
+#define REPORT_PERIOD_MS     2
+#define INPUT_PERIOD_MS      1
+#define DEBOUNCE_MS          10
 
-// Collective
-#define COLLECTIVE_GPIO       28
-#define COLLECTIVE_ADC_CH     2
-
-#define ADC_SAMPLES           8
-
-// Cyclic deadzone around calibrated center
-#define CYCLIC_DEADZONE       50
-
-// Change these if an axis moves in the wrong direction
-#define INVERT_CYCLIC_X       false
-#define INVERT_CYCLIC_Y       false
-#define INVERT_COLLECTIVE     false
-
-#define REPORT_PERIOD_MS      2
-#define DEBOUNCE_MS           10
-
+// Startup values until the first valid readings: cyclic/rudder centered,
+// collective/throttle/brakes at the low electrical end. No startup calibration.
+static joystick_report_t report = {
+    .x = 0, .y = 0, .z = -32767, .rx = -32767,
+    .ry = -32767, .rz = 0, .slider = -32767, .buttons = 0
+};
 
 // ================================================================
 // BUTTON MATRIX
@@ -98,29 +96,6 @@ static const int8_t button_map[MATRIX_ROWS][MATRIX_COLS] = {
 
 
 // ================================================================
-// HID REPORT
-// ================================================================
-
-typedef struct __attribute__((packed))
-{
-    int16_t x;
-    int16_t y;
-    int16_t z;
-
-    uint16_t buttons;
-
-} joystick_report_t;
-
-
-// ================================================================
-// AXIS STATE
-// ================================================================
-
-static uint16_t cyclic_x_center = 2048;
-static uint16_t cyclic_y_center = 2048;
-
-
-// ================================================================
 // BUTTON STATE
 // ================================================================
 
@@ -134,209 +109,46 @@ static uint16_t button_mask = 0;
 
 
 // ================================================================
-// ADC
+// AXIS INPUTS -- fixed electrical scaling, no center calibration or deadzone
 // ================================================================
 
 static void adc_setup(void)
 {
     adc_init();
-
-    adc_gpio_init(CYCLIC_X_GPIO);
-    adc_gpio_init(CYCLIC_Y_GPIO);
-    adc_gpio_init(COLLECTIVE_GPIO);
+    adc_gpio_init(RUDDER_GPIO);
+    adc_gpio_init(LEFT_BRAKE_GPIO);
+    adc_gpio_init(RIGHT_BRAKE_GPIO);
 }
 
-
-static uint16_t read_adc_average(uint input)
+static uint16_t read_adc_average(uint gpio)
 {
-    adc_select_input(input);
-
+    adc_select_input(gpio - 26);
+    (void)adc_read(); // Discard the first sample after changing the multiplexer.
     uint32_t total = 0;
-
-    for (int i = 0; i < ADC_SAMPLES; i++)
-    {
-        total += adc_read();
-    }
-
-    return (uint16_t)(total / ADC_SAMPLES);
+    for (int i = 0; i < ADC_SAMPLES; ++i) total += adc_read();
+    return (uint16_t)((total + ADC_SAMPLES / 2) / ADC_SAMPLES);
 }
 
-
-// ================================================================
-// CYCLIC CALIBRATION
-// ================================================================
-
-static void calibrate_cyclic(void)
+static void sample_pedals(void)
 {
-    /*
-     * Keep cyclic centered while Pico starts.
-     *
-     * Take several readings and use their average
-     * as the mechanical center.
-     */
-
-    uint32_t x_total = 0;
-    uint32_t y_total = 0;
-
-    const int samples = 64;
-
-
-    for (int i = 0; i < samples; i++)
-    {
-        x_total += read_adc_average(CYCLIC_X_ADC_CH);
-        y_total += read_adc_average(CYCLIC_Y_ADC_CH);
-
-        sleep_ms(2);
-    }
-
-
-    cyclic_x_center =
-        (uint16_t)(x_total / samples);
-
-    cyclic_y_center =
-        (uint16_t)(y_total / samples);
+    report.rz = scale_axis(read_adc_average(RUDDER_GPIO), PICO_ADC_FULL_SCALE, INVERT_RUDDER);
+    report.rx = scale_axis(read_adc_average(LEFT_BRAKE_GPIO), PICO_ADC_FULL_SCALE, INVERT_LEFT_BRAKE);
+    report.ry = scale_axis(read_adc_average(RIGHT_BRAKE_GPIO), PICO_ADC_FULL_SCALE, INVERT_RIGHT_BRAKE);
 }
 
-
-// ================================================================
-// CYCLIC AXIS SCALING
-// ================================================================
-
-static int16_t scale_cyclic(
-    uint16_t raw,
-    uint16_t center,
-    bool invert
-)
+static void sample_ads1115(void)
 {
-    int32_t delta =
-        (int32_t)raw -
-        (int32_t)center;
-
-
-    /*
-     * Deadzone around center.
-     */
-    if (
-        delta > -CYCLIC_DEADZONE &&
-        delta < CYCLIC_DEADZONE
-    )
-    {
-        delta = 0;
+    uint8_t channel;
+    int16_t raw;
+    if (!ads1115_poll(&channel, &raw)) return;
+    // Update only a completed channel. Keep the last good value on I2C failure.
+    switch (channel) {
+        case 0: report.x = scale_axis(raw, ADS1115_COUNTS_AT_3V3, INVERT_CYCLIC_X); break;
+        case 1: report.y = scale_axis(raw, ADS1115_COUNTS_AT_3V3, INVERT_CYCLIC_Y); break;
+        case 2: report.z = scale_axis(raw, ADS1115_COUNTS_AT_3V3, INVERT_COLLECTIVE); break;
+        case 3: report.slider = scale_axis(raw, ADS1115_COUNTS_AT_3V3, INVERT_THROTTLE); break;
     }
-    else if (delta > 0)
-    {
-        delta -= CYCLIC_DEADZONE;
-    }
-    else
-    {
-        delta += CYCLIC_DEADZONE;
-    }
-
-
-    /*
-     * Positive and negative travel can be different
-     * because the calibrated center may not be
-     * exactly 2048.
-     */
-
-    int32_t positive_span =
-        4095 -
-        center -
-        CYCLIC_DEADZONE;
-
-    int32_t negative_span =
-        center -
-        CYCLIC_DEADZONE;
-
-
-    if (positive_span < 1)
-    {
-        positive_span = 1;
-    }
-
-    if (negative_span < 1)
-    {
-        negative_span = 1;
-    }
-
-
-    int32_t output;
-
-
-    if (delta >= 0)
-    {
-        output =
-            (delta * 32767L) /
-            positive_span;
-    }
-    else
-    {
-        output =
-            (delta * 32767L) /
-            negative_span;
-    }
-
-
-    if (output > 32767)
-    {
-        output = 32767;
-    }
-
-    if (output < -32767)
-    {
-        output = -32767;
-    }
-
-
-    if (invert)
-    {
-        output = -output;
-    }
-
-
-    return (int16_t)output;
 }
-
-
-// ================================================================
-// COLLECTIVE AXIS SCALING
-// ================================================================
-
-static int16_t scale_collective(uint16_t raw)
-{
-    /*
-     * Collective uses the complete potentiometer range.
-     *
-     * ADC 0    -> -32767
-     * ADC 2048 -> ~0
-     * ADC 4095 -> +32767
-     */
-
-    int32_t output =
-        ((int32_t)raw * 65534L / 4095L)
-        - 32767L;
-
-
-    if (output > 32767)
-    {
-        output = 32767;
-    }
-
-    if (output < -32767)
-    {
-        output = -32767;
-    }
-
-
-    if (INVERT_COLLECTIVE)
-    {
-        output = -output;
-    }
-
-
-    return (int16_t)output;
-}
-
 
 // ================================================================
 // BUTTON MATRIX
@@ -360,15 +172,12 @@ static void matrix_disable_all_rows(void)
 
 static void matrix_activate_row(int row)
 {
-    /*
-     * Inactive rows = high impedance.
-     */
+    //Inactive rows = high impedance.
     matrix_disable_all_rows();
 
 
-    /*
-     * Current row = LOW.
-     */
+    // Current row = LOW.
+
     gpio_put(
         row_pins[row],
         0
@@ -415,9 +224,9 @@ static void matrix_init(void)
             GPIO_IN
         );
 
-        /*
-         * Columns normally HIGH.
-         */
+        
+        // Columns normally HIGH.
+         
         gpio_pull_up(
             col_pins[col]
         );
@@ -456,9 +265,9 @@ static void matrix_scan(void)
                 );
 
 
-            /*
-             * Raw electrical state changed.
-             */
+          
+            // Raw electrical state changed.
+            
             if (
                 pressed !=
                 raw_state[row][col]
@@ -472,9 +281,9 @@ static void matrix_scan(void)
             }
 
 
-            /*
-             * Accept the new state after debounce.
-             */
+          
+            // Accept the new state after debounce.
+            
             if (
                 (now -
                  state_change_time[row][col])
@@ -511,172 +320,54 @@ static void matrix_scan(void)
 
 
 // ================================================================
-// HID TASK
+// USB HID -- seven axes and button matrix
 // ================================================================
 
 static void hid_task(void)
 {
-    static uint32_t last_report_ms = 0;
-
-    static joystick_report_t last_report = {0};
-
-    static bool first_report = true;
-
-
-    uint32_t now =
-        to_ms_since_boot(
-            get_absolute_time()
-        );
-
-
-    if (
-        (now - last_report_ms)
-        < REPORT_PERIOD_MS
-    )
-    {
-        return;
-    }
-
-
-    last_report_ms = now;
-
-
-    if (!tud_hid_ready())
-    {
-        return;
-    }
-
-
-    /*
-     * Read all three analog controls.
-     */
-
-    uint16_t raw_x =
-        read_adc_average(
-            CYCLIC_X_ADC_CH
-        );
-
-    uint16_t raw_y =
-        read_adc_average(
-            CYCLIC_Y_ADC_CH
-        );
-
-    uint16_t raw_collective =
-        read_adc_average(
-            COLLECTIVE_ADC_CH
-        );
-
-
-    joystick_report_t report;
-
-
-    report.x =
-        scale_cyclic(
-            raw_x,
-            cyclic_x_center,
-            INVERT_CYCLIC_X
-        );
-
-
-    report.y =
-        scale_cyclic(
-            raw_y,
-            cyclic_y_center,
-            INVERT_CYCLIC_Y
-        );
-
-
-    report.z =
-        scale_collective(
-            raw_collective
-        );
-
-
-    report.buttons =
-        button_mask;
-
-
-    /*
-     * Only send report if something changed.
-     */
-
-    if (
-        first_report ||
-        memcmp(
-            &report,
-            &last_report,
-            sizeof(report)
-        ) != 0
-    )
-    {
-        if (
-            tud_hid_report(
-                0,
-                &report,
-                sizeof(report)
-            )
-        )
-        {
-            last_report =
-                report;
-
-            first_report =
-                false;
-        }
-    }
+    static uint32_t last_report_ms;
+    const uint32_t now = to_ms_since_boot(get_absolute_time());
+    if ((uint32_t)(now - last_report_ms) < REPORT_PERIOD_MS || !tud_hid_ready()) return;
+    report.buttons = button_mask;
+    // Periodic reports also resend the current position after USB reconnect/resume.
+    if (tud_hid_report(0, &report, sizeof(report))) last_report_ms = now;
 }
 
+uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
+                             hid_report_type_t report_type, uint8_t *buffer, uint16_t reqlen)
+{
+    if (instance != 0 || report_id != 0 || report_type != HID_REPORT_TYPE_INPUT) return 0;
+    uint16_t length = reqlen < sizeof(report) ? reqlen : sizeof(report);
+    memcpy(buffer, &report, length);
+    return length;
+}
 
-// ================================================================
-// MAIN
-// ================================================================
+void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
+                         hid_report_type_t report_type, const uint8_t *buffer, uint16_t size)
+{
+    (void)instance; (void)report_id; (void)report_type; (void)buffer; (void)size;
+}
 
 int main(void)
 {
-    stdio_init_all();
-
-
     adc_setup();
-
     matrix_init();
-
-
-    /*
-     * IMPORTANT:
-     *
-     * Keep cyclic centered during this calibration.
-     *
-     * Collective position does not matter.
-     */
-    calibrate_cyclic();
-
-
-    /*
-     * Start TinyUSB HID device.
-     */
+    ads1115_init();
+    sample_pedals();
     tusb_init();
+    uint32_t last_input_ms = to_ms_since_boot(get_absolute_time());
 
-
-    while (true)
-    {
-        /*
-         * USB stack.
-         */
+    while (true) {
         tud_task();
-
-
-        /*
-         * Buttons and switches.
-         */
-        matrix_scan();
-
-
-        /*
-         * X, Y, collective and buttons -> USB HID.
-         */
+        sample_ads1115(); // No sleep while the ADS1115 is converting.
+        const uint32_t now = to_ms_since_boot(get_absolute_time());
+        if ((uint32_t)(now - last_input_ms) >= INPUT_PERIOD_MS) {
+            last_input_ms = now;
+            matrix_scan();
+            report.buttons = button_mask;
+            sample_pedals();
+        }
         hid_task();
-
-
-        sleep_ms(1);
+        tight_loop_contents();
     }
 }
